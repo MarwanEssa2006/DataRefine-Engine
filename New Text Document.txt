@@ -1,0 +1,866 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import re
+import json
+import logging
+import hashlib
+from datetime import datetime
+from rapidfuzz import process  # pip install rapidfuzz
+
+# =========================================================
+# LOGGING SETUP - Every action is recorded with timestamp
+# =========================================================
+logging.basicConfig(
+    filename="data_refiner.log",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+class DataRefinerError(Exception):
+    """Custom exception for DataRefiner"""
+    pass
+
+
+class DataRefiner:
+    def __init__(self, file_path=None, dataframe=None):
+        """
+        Initialize engine from a file path OR an existing DataFrame.
+        Usage:
+            engine = DataRefiner('data.csv')
+            engine = DataRefiner(dataframe=my_df)
+        """
+        try:
+            if dataframe is not None:
+                self.df = dataframe.copy()
+            elif file_path:
+                if file_path.endswith('.csv'):
+                    self.df = pd.read_csv(file_path)
+                elif file_path.endswith(('.xlsx', '.xls')):
+                    self.df = pd.read_excel(file_path)
+                elif file_path.endswith('.json'):
+                    self.df = pd.read_json(file_path)
+                elif file_path.endswith('.parquet'):
+                    self.df = pd.read_parquet(file_path)
+                else:
+                    raise DataRefinerError(f"Unsupported file format: {file_path}")
+            else:
+                raise DataRefinerError("Provide either file_path or dataframe.")
+
+            self.original_df = self.df.copy()
+            self.snapshots = {}          # Named checkpoints
+            self.audit_log = []
+            self.error_log = []          # Tracks all non-fatal errors
+            self.stats_before = self._get_stats()
+
+            self._log(f"Engine initialized. Shape: {self.df.shape}")
+            print(f"✅ DataRefiner v2: Loaded {self.df.shape[0]} rows × {self.df.shape[1]} cols.")
+        except Exception as e:
+            logging.error(f"Init failed: {e}")
+            raise
+
+    # =========================================================
+    # INTERNAL HELPERS
+    # =========================================================
+
+    def _log(self, message, level="info"):
+        """Internal logger - writes to audit_log and log file"""
+        self.audit_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        getattr(logging, level)(message)
+
+    def _log_error(self, fn_name, error):
+        """Log non-fatal errors without crashing"""
+        msg = f"⚠️ {fn_name} encountered an issue: {error}"
+        self.error_log.append(msg)
+        logging.warning(msg)
+        print(msg)
+
+    def _get_stats(self):
+        """Snapshot current DataFrame statistics"""
+        return {
+            "rows": len(self.df),
+            "cols": len(self.df.columns),
+            "nulls": int(self.df.isnull().sum().sum()),
+            "duplicates": int(self.df.duplicated().sum()),
+        }
+
+    def _validate_column(self, column):
+        """Raise clear error if column doesn't exist"""
+        if column not in self.df.columns:
+            raise DataRefinerError(
+                f"Column '{column}' not found. Available: {list(self.df.columns)}"
+            )
+
+    # =========================================================
+    # 1. AUDITING & INSPECTION
+    # =========================================================
+
+    def run_audit(self):
+        """Full inspection report - no modifications"""
+        report = {
+            "shape": self.df.shape,
+            "columns": list(self.df.columns),
+            "dtypes": self.df.dtypes.astype(str).to_dict(),
+            "null_counts": self.df.isnull().sum().to_dict(),
+            "null_percent": (self.df.isnull().mean() * 100).round(2).to_dict(),
+            "duplicates": int(self.df.duplicated().sum()),
+            "memory_usage_mb": round(self.df.memory_usage(deep=True).sum() / 1e6, 3),
+            "numeric_summary": self.df.describe().to_dict(),
+        }
+        self._log("ran full audit.")
+        return report
+
+    def profile_column(self, column):
+        """Deep profile of a single column"""
+        self._validate_column(column)
+        col = self.df[column]
+        profile = {
+            "dtype": str(col.dtype),
+            "total": len(col),
+            "nulls": int(col.isnull().sum()),
+            "null_%": round(col.isnull().mean() * 100, 2),
+            "unique_count": int(col.nunique()),
+            "top_5_values": col.value_counts().head(5).to_dict(),
+        }
+        if pd.api.types.is_numeric_dtype(col):
+            profile.update({
+                "min": col.min(), "max": col.max(),
+                "mean": round(col.mean(), 4),
+                "std": round(col.std(), 4),
+                "skewness": round(col.skew(), 4),
+            })
+        self._log(f"Profiled column '{column}'.")
+        return profile
+
+    def detect_schema_issues(self):
+        """
+        Auto-detect common schema problems:
+        - Numeric data stored as strings
+        - Columns that look like dates
+        - Boolean-like columns stored as strings
+        """
+        issues = {}
+        for col in self.df.columns:
+            col_issues = []
+            sample = self.df[col].dropna().astype(str).head(100)
+
+            # Check if numeric stored as string
+            numeric_test = pd.to_numeric(
+                sample.str.replace(r'[$,%€£]', '', regex=True).str.replace(',', ''),
+                errors='coerce'
+            )
+            if numeric_test.notna().mean() > 0.85 and self.df[col].dtype == object:
+                col_issues.append("Numeric data stored as string")
+
+            # Check if date stored as string
+            try:
+                parsed = pd.to_datetime(sample, errors='coerce')
+                if parsed.notna().mean() > 0.85 and self.df[col].dtype == object:
+                    col_issues.append("Date stored as string")
+            except Exception:
+                pass
+
+            # Check boolean-like
+            unique_lower = set(sample.str.lower().unique())
+            bool_sets = [{'true', 'false'}, {'yes', 'no'}, {'1', '0'}, {'y', 'n'}]
+            if any(unique_lower.issubset(s) for s in bool_sets):
+                col_issues.append("Boolean-like values stored as string/int")
+
+            if col_issues:
+                issues[col] = col_issues
+
+        self._log(f"Schema issue detection complete. Found {len(issues)} column(s) with issues.")
+        return issues
+
+    # =========================================================
+    # 2. COLUMN & ROW MANAGEMENT
+    # =========================================================
+
+    def clean_column_names(self):
+        """Normalize column names to snake_case"""
+        clean_names = {
+            col: re.sub(r'\W+', '_', col).strip('_').lower()
+            for col in self.df.columns
+        }
+        self.df.rename(columns=clean_names, inplace=True)
+        self._log("Normalized column names to snake_case.")
+
+    def remove_duplicates(self, subset=None, keep='first'):
+        """
+        Remove duplicate rows.
+        subset: list of columns to check, None = all columns
+        keep: 'first', 'last', or False (drop all)
+        """
+        count = self.df.duplicated(subset=subset).sum()
+        self.df.drop_duplicates(subset=subset, keep=keep, inplace=True)
+        self._log(f"Removed {count} duplicate rows.")
+
+    def drop_empty_rows(self):
+        """Remove rows that are entirely empty or whitespace"""
+        before = len(self.df)
+        self.df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+        self.df.dropna(how='all', inplace=True)
+        self._log(f"Dropped {before - len(self.df)} fully empty rows.")
+
+    def drop_sparse_columns(self, threshold=0.5):
+        """Drop columns where null % exceeds threshold"""
+        null_ratio = self.df.isnull().mean()
+        cols_to_drop = null_ratio[null_ratio > threshold].index.tolist()
+        self.df.drop(columns=cols_to_drop, inplace=True)
+        self._log(f"Dropped {len(cols_to_drop)} sparse columns: {cols_to_drop}")
+
+    def drop_constant_columns(self, variance_threshold=0.01):
+        """Remove columns with nearly zero variation"""
+        numeric_cols = self.df.select_dtypes(include=[np.number]).columns
+        cols_to_drop = [col for col in numeric_cols if self.df[col].var() < variance_threshold]
+        self.df.drop(columns=cols_to_drop, inplace=True)
+        self._log(f"Dropped constant columns: {cols_to_drop}")
+
+    def drop_highly_correlated(self, threshold=0.95):
+        """Remove redundant highly-correlated columns"""
+        numeric_df = self.df.select_dtypes(include=[np.number])
+        corr_matrix = numeric_df.corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
+        self.df.drop(columns=to_drop, inplace=True)
+        self._log(f"Dropped highly correlated columns: {to_drop}")
+
+    def split_column(self, column, delimiter, new_columns: list):
+        """Split one column into multiple columns"""
+        self._validate_column(column)
+        split_data = self.df[column].astype(str).str.split(delimiter, expand=True)
+        for i, new_col in enumerate(new_columns):
+            if i < split_data.shape[1]:
+                self.df[new_col] = split_data[i]
+        self._log(f"Split '{column}' into {new_columns}.")
+
+    def merge_columns(self, columns: list, new_column: str, separator=" "):
+        """Combine multiple columns into one"""
+        for col in columns:
+            self._validate_column(col)
+        self.df[new_column] = self.df[columns].astype(str).agg(separator.join, axis=1)
+        self._log(f"Merged {columns} into '{new_column}'.")
+
+    def rename_columns(self, mapping: dict):
+        """
+        Rename specific columns.
+        mapping = {'old_name': 'new_name'}
+        """
+        self.df.rename(columns=mapping, inplace=True)
+        self._log(f"Renamed columns: {mapping}")
+
+    def reorder_columns(self, order: list):
+        """
+        Reorder DataFrame columns.
+        order = ['col1', 'col2', ...]
+        Columns not in list are appended at the end.
+        """
+        remaining = [c for c in self.df.columns if c not in order]
+        self.df = self.df[order + remaining]
+        self._log(f"Reordered columns.")
+
+    # =========================================================
+    # 3. NULL HANDLING
+    # =========================================================
+
+    def handle_nulls(self, strategy="mean", fill_value=None, columns=None):
+        """
+        Fill missing values.
+        strategy: 'mean', 'median', 'mode', 'constant', 'ffill', 'bfill', 'interpolate'
+        columns: list of specific columns, None = all
+        """
+        numeric_cols = columns or self.df.select_dtypes(include=[np.number]).columns.tolist()
+
+        for col in numeric_cols:
+            if col not in self.df.columns:
+                continue
+            try:
+                if strategy == "mean":
+                    self.df[col] = self.df[col].fillna(self.df[col].mean())
+                elif strategy == "median":
+                    self.df[col] = self.df[col].fillna(self.df[col].median())
+                elif strategy == "mode":
+                    self.df[col] = self.df[col].fillna(self.df[col].mode()[0])
+                elif strategy == "constant":
+                    self.df[col] = self.df[col].fillna(fill_value if fill_value is not None else 0)
+                elif strategy == "ffill":
+                    self.df[col] = self.df[col].ffill()
+                elif strategy == "bfill":
+                    self.df[col] = self.df[col].bfill()
+                elif strategy == "interpolate":
+                    self.df[col] = self.df[col].interpolate(method='linear', limit_direction='both')
+            except Exception as e:
+                self._log_error(f"handle_nulls[{col}]", e)
+
+        text_cols = self.df.select_dtypes(include=['object']).columns
+        self.df[text_cols] = self.df[text_cols].fillna("Unknown")
+        self._log(f"Handled nulls using '{strategy}' strategy.")
+
+    def smart_impute(self):
+        """
+        Automatically choose best null-fill strategy per column:
+        - Low skew → mean
+        - High skew → median
+        - Categorical → mode
+        """
+        for col in self.df.columns:
+            if self.df[col].isnull().sum() == 0:
+                continue
+            if pd.api.types.is_numeric_dtype(self.df[col]):
+                skewness = abs(self.df[col].skew())
+                if skewness < 1:
+                    self.df[col] = self.df[col].fillna(self.df[col].mean())
+                else:
+                    self.df[col] = self.df[col].fillna(self.df[col].median())
+            else:
+                mode = self.df[col].mode()
+                self.df[col] = self.df[col].fillna(mode[0] if not mode.empty else "Unknown")
+        self._log("Smart imputation applied based on column skewness.")
+
+    # =========================================================
+    # 4. TYPE ENFORCEMENT
+    # =========================================================
+
+    def enforce_dtypes(self, schema: dict):
+        """
+        Force columns to specific types.
+        schema = {'age': 'int', 'price': 'float', 'name': 'str'}
+        """
+        for col, dtype in schema.items():
+            if col not in self.df.columns:
+                self._log_error("enforce_dtypes", f"Column '{col}' not found.")
+                continue
+            try:
+                self.df[col] = self.df[col].astype(dtype)
+            except Exception as e:
+                self._log_error(f"enforce_dtypes[{col}]", e)
+        self._log(f"Enforced dtypes: {schema}")
+
+    def fix_numeric_strings(self, columns=None):
+        """Convert '$1,200.50' or '15%' to proper floats"""
+        cols = columns or self.df.select_dtypes(include=['object']).columns.tolist()
+        converted = []
+        for col in cols:
+            cleaned = (
+                self.df[col].astype(str)
+                .str.replace(r'[$,%,€,£]', '', regex=True)
+                .str.replace(',', '', regex=False)
+                .str.strip()
+            )
+            try:
+                self.df[col] = pd.to_numeric(cleaned)
+                converted.append(col)
+            except (ValueError, TypeError):
+                pass
+        self._log(f"Converted numeric strings in: {converted}")
+
+    def fix_date_formats(self, columns=None):
+        """Unify date columns to datetime"""
+        if columns:
+            target_cols = columns
+        else:
+            target_cols = [c for c in self.df.columns if 'date' in c.lower() or 'time' in c.lower()]
+        for col in target_cols:
+            self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
+        self._log(f"Unified date formats in: {target_cols}")
+
+    def convert_booleans(self, columns=None):
+        """
+        Convert yes/no, true/false, 1/0 to proper Python booleans.
+        """
+        cols = columns or self.df.select_dtypes(include=['object']).columns.tolist()
+        bool_map = {
+            'true': True, 'false': False,
+            'yes': True, 'no': False,
+            '1': True, '0': False,
+            'y': True, 'n': False,
+        }
+        converted = []
+        for col in cols:
+            unique_lower = set(self.df[col].dropna().astype(str).str.lower().unique())
+            if unique_lower.issubset(set(bool_map.keys())):
+                self.df[col] = self.df[col].astype(str).str.lower().map(bool_map)
+                converted.append(col)
+        self._log(f"Converted boolean columns: {converted}")
+
+    # =========================================================
+    # 5. TEXT CLEANING
+    # =========================================================
+
+    def standardize_strings(self):
+        """Clean whitespace and SQL-breaking characters"""
+        string_cols = self.df.select_dtypes(include=['object']).columns
+        for col in string_cols:
+            self.df[col] = self.df[col].astype(str).str.strip().str.capitalize()
+            self.df[col] = self.df[col].apply(lambda x: re.sub(r"['\"\;]", "", x))
+        self._log("Standardized strings.")
+
+    def normalize_text_case(self, columns=None, case="lower"):
+        """Normalize text case: 'lower', 'upper', 'title'"""
+        cols = columns or self.df.select_dtypes(include=['object']).columns.tolist()
+        for col in cols:
+            if case == "lower":
+                self.df[col] = self.df[col].astype(str).str.lower()
+            elif case == "upper":
+                self.df[col] = self.df[col].astype(str).str.upper()
+            elif case == "title":
+                self.df[col] = self.df[col].astype(str).str.title()
+        self._log(f"Normalized text case to '{case}'.")
+
+    def strip_html_tags(self, columns=None):
+        """Remove HTML tags from text columns"""
+        cols = columns or self.df.select_dtypes(include=['object']).columns.tolist()
+        for col in cols:
+            self.df[col] = self.df[col].astype(str).apply(
+                lambda x: re.sub(r'<[^>]+>', '', x).strip()
+            )
+        self._log(f"Stripped HTML tags from: {cols}")
+
+    def remove_special_characters(self, columns=None, keep_spaces=True):
+        """Remove non-alphanumeric characters from text"""
+        cols = columns or self.df.select_dtypes(include=['object']).columns.tolist()
+        pattern = r'[^a-zA-Z0-9\s]' if keep_spaces else r'[^a-zA-Z0-9]'
+        for col in cols:
+            self.df[col] = self.df[col].astype(str).apply(lambda x: re.sub(pattern, '', x).strip())
+        self._log(f"Removed special characters from: {cols}")
+
+    def cap_string_length(self, max_length=255, columns=None):
+        """Truncate strings beyond max character limit"""
+        cols = columns or self.df.select_dtypes(include=['object']).columns.tolist()
+        for col in cols:
+            self.df[col] = self.df[col].astype(str).str[:max_length]
+        self._log(f"Capped string length to {max_length}.")
+
+    def remove_extra_whitespace(self, columns=None):
+        """Replace multiple spaces with single space"""
+        cols = columns or self.df.select_dtypes(include=['object']).columns.tolist()
+        for col in cols:
+            self.df[col] = self.df[col].astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
+        self._log("Removed extra whitespace.")
+
+    def replace_values(self, column, mapping: dict):
+        """
+        Replace specific values in a column.
+        mapping = {'M': 'Male', 'F': 'Female'}
+        """
+        self._validate_column(column)
+        self.df[column] = self.df[column].replace(mapping)
+        self._log(f"Replaced values in '{column}': {mapping}")
+
+    # =========================================================
+    # 6. OUTLIER HANDLING
+    # =========================================================
+
+    def handle_outliers(self, method="zscore", threshold=3, columns=None):
+        """
+        Handle outliers using multiple methods.
+        method: 'zscore' (cap), 'iqr' (cap), 'drop' (remove rows)
+        """
+        cols = columns or self.df.select_dtypes(include=[np.number]).columns.tolist()
+        for col in cols:
+            try:
+                if method == "zscore":
+                    mean, std = self.df[col].mean(), self.df[col].std()
+                    upper, lower = mean + threshold * std, mean - threshold * std
+                    self.df[col] = self.df[col].clip(lower=lower, upper=upper)
+
+                elif method == "iqr":
+                    q1 = self.df[col].quantile(0.25)
+                    q3 = self.df[col].quantile(0.75)
+                    iqr = q3 - q1
+                    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                    self.df[col] = self.df[col].clip(lower=lower, upper=upper)
+
+                elif method == "drop":
+                    z_scores = np.abs(stats.zscore(self.df[col].fillna(self.df[col].mean())))
+                    self.df = self.df[z_scores < threshold]
+            except Exception as e:
+                self._log_error(f"handle_outliers[{col}]", e)
+        self._log(f"Handled outliers using '{method}' method.")
+
+    # =========================================================
+    # 7. VALIDATION
+    # =========================================================
+
+    def validate_emails(self, column, action="flag"):
+        """Validate email format. action: 'flag' or 'drop'"""
+        self._validate_column(column)
+        pattern = r'^[\w\.-]+@[\w\.-]+\.\w{2,}$'
+        mask = self.df[column].astype(str).str.match(pattern)
+        if action == "flag":
+            self.df[f'{column}_is_valid'] = mask
+        elif action == "drop":
+            before = len(self.df)
+            self.df = self.df[mask]
+            self._log(f"Dropped {before - len(self.df)} invalid emails.")
+        self._log(f"Validated emails in '{column}'.")
+
+    def validate_phones(self, column, action="flag"):
+        """Validate phone numbers. action: 'flag' or 'drop'"""
+        self._validate_column(column)
+        pattern = r'^\+?[\d\s\-\(\)]{7,15}$'
+        mask = self.df[column].astype(str).str.match(pattern)
+        if action == "flag":
+            self.df[f'{column}_is_valid'] = mask
+        elif action == "drop":
+            before = len(self.df)
+            self.df = self.df[mask]
+            self._log(f"Dropped {before - len(self.df)} invalid phones.")
+        self._log(f"Validated phones in '{column}'.")
+
+    def validate_ranges(self, rules: dict):
+        """
+        Detect rows violating business rules.
+        rules = {'age': (0, 120), 'score': (0, 100)}
+        Returns DataFrame of violations.
+        """
+        violations = pd.DataFrame()
+        for col, (min_val, max_val) in rules.items():
+            if col in self.df.columns:
+                mask = (self.df[col] < min_val) | (self.df[col] > max_val)
+                violations = pd.concat([violations, self.df[mask]])
+        self._log(f"Validated ranges for: {list(rules.keys())}")
+        return violations.drop_duplicates()
+
+    def validate_no_future_dates(self, column):
+        """Flag rows where date column has future dates"""
+        self._validate_column(column)
+        self.df[column] = pd.to_datetime(self.df[column], errors='coerce')
+        self.df[f'{column}_is_future'] = self.df[column] > pd.Timestamp.now()
+        flagged = self.df[f'{column}_is_future'].sum()
+        self._log(f"Flagged {flagged} future dates in '{column}'.")
+
+    def validate_foreign_keys(self, column, valid_values: list, action="flag"):
+        """
+        Check if column values exist in a reference list.
+        action: 'flag' or 'drop'
+        """
+        self._validate_column(column)
+        mask = self.df[column].isin(valid_values)
+        if action == "flag":
+            self.df[f'{column}_valid_fk'] = mask
+        elif action == "drop":
+            before = len(self.df)
+            self.df = self.df[mask]
+            self._log(f"Dropped {before - len(self.df)} rows with invalid foreign keys.")
+        self._log(f"Validated foreign keys in '{column}'.")
+
+    def check_referential_integrity(self, col1, col2):
+        """
+        Check if values in col2 all exist in col1.
+        Useful for parent-child relationships.
+        """
+        self._validate_column(col1)
+        self._validate_column(col2)
+        missing = set(self.df[col2].dropna()) - set(self.df[col1].dropna())
+        self._log(f"Referential integrity check: {len(missing)} values in '{col2}' missing from '{col1}'.")
+        return missing
+
+    # =========================================================
+    # 8. ML PREPARATION
+    # =========================================================
+
+    def normalize_columns(self, method="minmax", columns=None):
+        """Scale numeric data. methods: 'minmax', 'zscore'"""
+        cols = columns or self.df.select_dtypes(include=[np.number]).columns.tolist()
+        for col in cols:
+            try:
+                if method == "minmax":
+                    col_min, col_max = self.df[col].min(), self.df[col].max()
+                    if col_max != col_min:
+                        self.df[col] = (self.df[col] - col_min) / (col_max - col_min)
+                elif method == "zscore":
+                    std = self.df[col].std()
+                    if std != 0:
+                        self.df[col] = (self.df[col] - self.df[col].mean()) / std
+            except Exception as e:
+                self._log_error(f"normalize_columns[{col}]", e)
+        self._log(f"Normalized columns using '{method}'.")
+
+    def encode_categoricals(self, method="label", columns=None):
+        """
+        Encode text columns. methods: 'label', 'onehot', 'frequency'
+        """
+        cols = columns or self.df.select_dtypes(include=['object']).columns.tolist()
+        if method == "label":
+            for col in cols:
+                self.df[col] = pd.Categorical(self.df[col]).codes
+        elif method == "onehot":
+            self.df = pd.get_dummies(self.df, columns=cols)
+        elif method == "frequency":
+            for col in cols:
+                freq_map = self.df[col].value_counts(normalize=True).to_dict()
+                self.df[col] = self.df[col].map(freq_map)
+        self._log(f"Encoded categoricals using '{method}' encoding.")
+
+    def add_datetime_features(self, column):
+        """
+        Extract year, month, day, weekday, quarter from a date column.
+        Great for ML feature engineering.
+        """
+        self._validate_column(column)
+        self.df[column] = pd.to_datetime(self.df[column], errors='coerce')
+        self.df[f'{column}_year']    = self.df[column].dt.year
+        self.df[f'{column}_month']   = self.df[column].dt.month
+        self.df[f'{column}_day']     = self.df[column].dt.day
+        self.df[f'{column}_weekday'] = self.df[column].dt.day_name()
+        self.df[f'{column}_quarter'] = self.df[column].dt.quarter
+        self._log(f"Extracted datetime features from '{column}'.")
+
+    # =========================================================
+    # 9. PRIVACY & SECURITY
+    # =========================================================
+
+    def mask_pii(self, columns: list, mask_char="*"):
+        """Partially mask sensitive data"""
+        for col in columns:
+            if col in self.df.columns:
+                self.df[col] = self.df[col].astype(str).apply(
+                    lambda x: x[:2] + mask_char * (len(x) - 4) + x[-2:] if len(x) > 4 else mask_char * len(x)
+                )
+        self._log(f"Masked PII columns: {columns}")
+
+    def hash_column(self, column, algorithm="sha256"):
+        """
+        Irreversibly hash a column (e.g., passwords, IDs).
+        algorithm: 'sha256', 'md5'
+        """
+        self._validate_column(column)
+        hash_fn = hashlib.sha256 if algorithm == "sha256" else hashlib.md5
+        self.df[column] = self.df[column].astype(str).apply(
+            lambda x: hash_fn(x.encode()).hexdigest()
+        )
+        self._log(f"Hashed column '{column}' using {algorithm}.")
+
+    def flag_test_data(self, keywords=None):
+        """Flag rows that look like test/junk data"""
+        default_keywords = keywords or ['test', 'dummy', 'fake', 'sample', 'null', 'xxx', 'n/a', 'na']
+        pattern = '|'.join(default_keywords)
+        string_cols = self.df.select_dtypes(include=['object']).columns
+        mask = self.df[string_cols].apply(
+            lambda col: col.astype(str).str.lower().str.contains(pattern, na=False)
+        ).any(axis=1)
+        self.df['is_test_data'] = mask
+        self._log(f"Flagged {mask.sum()} rows as test/junk data.")
+        return self.df[mask]
+
+    # =========================================================
+    # 10. FUZZY & INTELLIGENCE
+    # =========================================================
+
+    def fuzzy_match_column(self, column, threshold=90):
+        """Detect similar-looking values (e.g. Cairo vs Cario)"""
+        self._validate_column(column)
+        unique_vals = self.df[column].unique()
+        suggestions = []
+        for val in unique_vals:
+            matches = process.extract(val, unique_vals, score_cutoff=threshold)
+            if len(matches) > 1:
+                suggestions.append([m[0] for m in matches])
+        return suggestions
+
+    def auto_fix_typos(self, column, threshold=90):
+        """
+        Auto-fix typos by replacing minority variants with the most
+        common version of similar strings.
+        Example: 'Cario' → 'Cairo'
+        """
+        self._validate_column(column)
+        value_counts = self.df[column].value_counts()
+        unique_vals = list(value_counts.index)
+        fix_map = {}
+
+        for val in unique_vals:
+            if val in fix_map:
+                continue
+            matches = process.extract(val, unique_vals, score_cutoff=threshold)
+            if len(matches) > 1:
+                # Most frequent value is the "correct" one
+                best = max(matches, key=lambda m: value_counts.get(m[0], 0))[0]
+                for m in matches:
+                    if m[0] != best:
+                        fix_map[m[0]] = best
+
+        self.df[column] = self.df[column].replace(fix_map)
+        self._log(f"Auto-fixed {len(fix_map)} typos in '{column}': {fix_map}")
+        return fix_map
+
+    # =========================================================
+    # 11. CHECKPOINTS & RECOVERY
+    # =========================================================
+
+    def take_snapshot(self, name: str):
+        """Save current state as a named checkpoint"""
+        self.snapshots[name] = self.df.copy()
+        self._log(f"Snapshot saved: '{name}'.")
+        print(f"📸 Snapshot '{name}' saved.")
+
+    def restore_snapshot(self, name: str):
+        """Restore DataFrame from a named checkpoint"""
+        if name not in self.snapshots:
+            raise DataRefinerError(f"Snapshot '{name}' not found. Available: {list(self.snapshots.keys())}")
+        self.df = self.snapshots[name].copy()
+        self._log(f"Restored snapshot: '{name}'.")
+        print(f"♻️  Restored to snapshot '{name}'.")
+
+    def rollback(self):
+        """Restore original unmodified data"""
+        self.df = self.original_df.copy()
+        self._log("Rolled back to original dataset.")
+        print("✅ Rollback complete.")
+
+    # =========================================================
+    # 12. COMPARISON & REPORTING
+    # =========================================================
+
+    def diff_report(self):
+        """
+        Compare original vs current state.
+        Shows what changed after cleaning.
+        """
+        stats_after = self._get_stats()
+        report = {
+            "rows_removed":    self.stats_before["rows"]      - stats_after["rows"],
+            "cols_removed":    self.stats_before["cols"]       - stats_after["cols"],
+            "nulls_fixed":     self.stats_before["nulls"]      - stats_after["nulls"],
+            "duplicates_removed": self.stats_before["duplicates"] - stats_after["duplicates"],
+            "before":          self.stats_before,
+            "after":           stats_after,
+        }
+        self._log("Generated diff report.")
+        return report
+
+    def get_final_report(self):
+        """Return full audit log"""
+        return self.audit_log
+
+    def get_error_log(self):
+        """Return all non-fatal errors encountered"""
+        return self.error_log
+
+    def export_report(self, path="cleaning_report.json"):
+        """Export full audit log + diff to JSON file"""
+        report = {
+            "audit_log":  self.audit_log,
+            "error_log":  self.error_log,
+            "diff":       self.diff_report(),
+            "generated":  datetime.now().isoformat(),
+        }
+        with open(path, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        print(f"📄 Report exported to {path}")
+        return path
+
+    # =========================================================
+    # 13. OUTPUT
+    # =========================================================
+
+    def save_cleaned_data(self, output_path="cleaned_data.csv"):
+        """Save cleaned data to CSV, Excel, JSON, or Parquet"""
+        if output_path.endswith('.csv'):
+            self.df.to_csv(output_path, index=False)
+        elif output_path.endswith(('.xlsx', '.xls')):
+            self.df.to_excel(output_path, index=False)
+        elif output_path.endswith('.json'):
+            self.df.to_json(output_path, orient='records', indent=2)
+        elif output_path.endswith('.parquet'):
+            self.df.to_parquet(output_path, index=False)
+        self._log(f"Saved cleaned data to '{output_path}'.")
+        return f"💾 Saved to {output_path}"
+
+    # =========================================================
+    # 14. ONE-CLICK FULL PIPELINE
+    # =========================================================
+
+    def run_full_pipeline(self, null_strategy="median", outlier_method="iqr", outlier_threshold=3):
+        """
+        Run all cleaning steps in the optimal order.
+        Zero manual configuration needed.
+        """
+        print("🚀 Starting Full Cleaning Pipeline...\n")
+        steps = [
+            ("Cleaning column names",       self.clean_column_names),
+            ("Removing duplicates",          self.remove_duplicates),
+            ("Dropping empty rows",          self.drop_empty_rows),
+            ("Dropping sparse columns",      self.drop_sparse_columns),
+            ("Stripping HTML tags",          self.strip_html_tags),
+            ("Removing extra whitespace",    self.remove_extra_whitespace),
+            ("Fixing numeric strings",       self.fix_numeric_strings),
+            ("Converting booleans",          self.convert_booleans),
+            ("Smart imputation of nulls",    self.smart_impute),
+            ("Standardizing strings",        self.standardize_strings),
+            ("Handling outliers",            lambda: self.handle_outliers(method=outlier_method, threshold=outlier_threshold)),
+            ("Fixing date formats",          self.fix_date_formats),
+            ("Dropping constant columns",    self.drop_constant_columns),
+            ("Dropping highly correlated",   self.drop_highly_correlated),
+        ]
+
+        passed, failed = 0, 0
+        for label, fn in steps:
+            try:
+                fn()
+                print(f"  ✅ {label}")
+                passed += 1
+            except Exception as e:
+                print(f"  ⚠️  {label} — skipped ({e})")
+                self._log_error(label, e)
+                failed += 1
+
+        print(f"\n🎉 Pipeline Complete! {passed} passed · {failed} skipped")
+        print(f"📊 {self.diff_report()}")
+        return self.get_final_report()
+
+
+# =========================================================
+# USAGE EXAMPLES
+# =========================================================
+#
+# --- ONE-CLICK CLEAN ---
+# engine = DataRefiner('data.csv')
+# engine.run_full_pipeline()
+# engine.save_cleaned_data('output.csv')
+# engine.export_report('report.json')
+#
+# --- STEP BY STEP ---
+# engine = DataRefiner('data.csv')
+# print(engine.run_audit())
+# print(engine.detect_schema_issues())
+# engine.take_snapshot('raw')
+# engine.clean_column_names()
+# engine.remove_duplicates()
+# engine.drop_empty_rows()
+# engine.drop_sparse_columns(threshold=0.4)
+# engine.fix_numeric_strings()
+# engine.convert_booleans()
+# engine.smart_impute()
+# engine.standardize_strings()
+# engine.normalize_text_case(case='title')
+# engine.strip_html_tags()
+# engine.remove_extra_whitespace()
+# engine.remove_special_characters()
+# engine.handle_outliers(method='iqr')
+# engine.fix_date_formats()
+# engine.validate_emails('email', action='flag')
+# engine.validate_phones('phone', action='flag')
+# engine.validate_ranges({'age': (0, 120), 'score': (0, 100)})
+# engine.validate_no_future_dates('signup_date')
+# engine.validate_foreign_keys('country', valid_countries_list)
+# engine.auto_fix_typos('city')
+# engine.mask_pii(['email', 'phone'])
+# engine.hash_column('password')
+# engine.flag_test_data()
+# engine.drop_constant_columns()
+# engine.drop_highly_correlated(threshold=0.95)
+# engine.add_datetime_features('signup_date')
+# engine.normalize_columns(method='minmax')
+# engine.encode_categoricals(method='label')
+# engine.split_column('full_name', ' ', ['first_name', 'last_name'])
+# engine.take_snapshot('cleaned')
+# engine.save_cleaned_data('output.csv')
+# engine.export_report('report.json')
+# print(engine.diff_report())
+# print(engine.get_error_log())
+#
+# --- ROLLBACK ---
+# engine.restore_snapshot('raw')   # back to a named snapshot
+# engine.rollback()                 # back to original file

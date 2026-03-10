@@ -89,11 +89,11 @@ class DataAuditor:
             sample = pd.read_csv(path, nrows=5000)
             opt_dtypes = {}
             for col in sample.select_dtypes(include=[np.number]).columns:
-                col_data = sample[col].dropna()
-                if len(col_data) > 0 and col_data.apply(lambda x: float(x).is_integer()).all():
-                    opt_dtypes[col] = "Int32"
-                else:
-                    opt_dtypes[col] = "float32"
+                # FIX: always use float32 for numeric columns — never Int32.
+                # The sample covers only 5,000 rows; columns that look like
+                # integers in the sample may have fractional values further in
+                # the file. Casting to Int32 would silently truncate those.
+                opt_dtypes[col] = "float32"
             for col in sample.select_dtypes(include="object").columns:
                 if sample[col].nunique() / len(sample) < 0.5:
                     opt_dtypes[col] = "category"       # low-cardinality strings
@@ -122,7 +122,7 @@ class DataAuditor:
             "category":    "A",
             "found":       count > 0,
             "count":       count,
-            "pct":         round(count / n * 100, 2),
+            "pct":         round(count / n * 100, 2) if n > 0 else 0.0,
             "severity":    self._sev(count, n * 0.1, 1),
             "fix_key":     "remove_duplicates",
             "suggestion":  f"Remove {count} exact duplicate rows.",
@@ -727,6 +727,25 @@ class DataCleaner:
         self._audit_report             = audit_report or {}   # for threshold sharing
         self.stats_before              = self._stats()
 
+    @classmethod
+    def from_dataframe(cls, df: "pd.DataFrame", audit_report: dict = None) -> "DataCleaner":
+        """
+        Create a DataCleaner directly from an in-memory DataFrame, skipping
+        all disk I/O. Used by run_auditor() and app.py to share the DataFrame
+        already loaded by DataAuditor — no second read, no dtype mismatch,
+        no temp-file leak.
+        """
+        instance = cls.__new__(cls)
+        instance.df                        = df.copy()
+        instance.original_df               = df.copy()
+        instance.snapshots                 = {}
+        instance.audit_log                 = []
+        instance.error_log                 = []
+        instance.dropped_duplicate_indices = []
+        instance._audit_report             = audit_report or {}
+        instance.stats_before              = instance._stats()
+        return instance
+
     def _stats(self):
         return {"rows": len(self.df), "cols": len(self.df.columns),
                 "nulls": int(self.df.isnull().sum().sum()),
@@ -797,7 +816,9 @@ class DataCleaner:
             f"(compared on {len(subset) if subset else 'all'} columns, datetime cols excluded). "
             f"Indices (first 100): {dropped_idx[:100]}"
         )
-        logging.info(f"remove_duplicates FULL index list: {dropped_idx}")
+        # NOTE: full index list is stored in self.dropped_duplicate_indices
+        # and written to a separate trail file by FinalReport.generate() if
+        # len > 1,000. We do NOT log it here to avoid bloating the log file.
 
     def drop_empty_rows(self):
         before = len(self.df)
@@ -1194,8 +1215,9 @@ class DataCleaner:
         self._log(f"hash_column '{column}' ({algorithm})")
 
     def flag_test_data(self):
+        # Keep this list in sync with DataAuditor._check_test_data()
         keywords = [r'\btest\b', r'\bdummy\b', r'\bfake\b', r'\bsample\b',
-                    r'\bxxx\b', r'\bn/a\b', r'\bnull\b', r'\basdf\b']
+                    r'\bxxx\b', r'\bn/a\b', r'\bnull\b', r'\basdf\b', r'\b123\b']
         pattern  = '|'.join(keywords)
         tcols    = self.df.select_dtypes(include="object").columns
         mask     = self.df[tcols].apply(
@@ -1347,10 +1369,22 @@ class FinalReport:
         self.permissions = permissions
 
     def _rescore(self):
-        temp            = DataAuditor.__new__(DataAuditor)
-        temp.df         = self.cleaner.df
-        temp.file_path  = "cleaned"
+        # BUG FIX: DataAuditor.__new__ skips __init__ so we must set all
+        # instance attributes manually to avoid AttributeError in checks.
+        temp               = DataAuditor.__new__(DataAuditor)
+        temp.df            = self.cleaner.df.copy()
+        temp.file_path     = "cleaned"
         temp.original_shape = self.cleaner.df.shape
+        temp.report        = {}   # required by _print_report / _health_score
+
+        # FIX: read back the threshold used in the original audit so the
+        # rescore uses the exact same sensitivity — avoids before/after drift.
+        corr_threshold = (
+            self.auditor.report.get("checks", {})
+            .get("high_correlation", {})
+            .get("threshold", 0.95)
+        )
+
         checks = {
             "duplicates":       temp._check_duplicates(),
             "empty_rows":       temp._check_empty_rows(),
@@ -1362,7 +1396,7 @@ class FinalReport:
             "data_types":       temp._check_data_types(),
             "sparse_columns":   temp._check_sparse_columns(),
             "constant_columns": temp._check_constant_columns(),
-            "high_correlation": temp._check_high_correlation(),
+            "high_correlation": temp._check_high_correlation(threshold=corr_threshold),
             "email_format":     temp._check_email_format(),
             "phone_format":     temp._check_phone_format(),
             "test_data":        temp._check_test_data(),
@@ -1405,6 +1439,12 @@ class FinalReport:
             "dropped_duplicate_indices":       all_indices[:1000],
             "dropped_duplicate_indices_total": len(all_indices),
             "dropped_duplicate_indices_note":  indices_note,
+            # BUG FIX: also expose diff keys at top level so callers
+            # don't need to drill into ["diff"] to get common metrics.
+            "rows_removed":    diff.get("rows_removed", 0),
+            "cols_removed":    diff.get("cols_removed", 0),
+            "nulls_fixed":     diff.get("nulls_fixed",  0),
+            "duplicates_removed": diff.get("duplicates_removed", 0),
         }
 
         self.cleaner.save(output_path)
@@ -1465,11 +1505,9 @@ def run_auditor(
 
     # FIX: create cleaner then inject auditor's df directly
     # so both work on the exact same in-memory state
-    cleaner             = DataCleaner(file_path, audit_report=report)
-    cleaner.df          = auditor.df.copy()
-    cleaner.original_df = cleaner.df.copy()
-    cleaner.stats_before = cleaner._stats()
-
+    # BUG FIX: use from_dataframe() so the cleaner works on the same
+    # already-loaded DataFrame — no second disk read, no dtype mismatch.
+    cleaner = DataCleaner.from_dataframe(auditor.df, audit_report=report)
     cleaner.run(permissions, skew_threshold=skew_threshold)
     summary = FinalReport(auditor, cleaner, permissions).generate(output_path)
     return summary
